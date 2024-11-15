@@ -16,7 +16,7 @@ int set_up_server(int PORT);
 void begin(int player_fd, int player, int *width, int *height);
 void create_board(int *width, int *height);
 void initialize(int player_fd, int player, char* pieces_info, int *width, int *height);
-void shoot(int player_fd, int player, int *width, int *height);
+bool shoot(int shooter_fd, int opponent_fd, int player, int *width, int *height);
 
 //check Piece Shape and rotation for Board Functions
 bool shapeInRange(int shape);
@@ -34,29 +34,47 @@ bool checkShape7(int rotation, int row,int col, int width, int height);
 bool checkOverlap(int player, int pieces[5][4], int *width, int *height); 
 void resetBoard(int player, int *width, int *height);
 
+//shoot helper functions
+bool check_ships_sunk(int **board, int width, int height); 
+
 
 int main(){
     printf("Welcome to the game of Battleship!\n");
-    printf("main blablabla");
-    printf("blablabla");
     int player1_fd = set_up_server(2201); // Port for player 1
     int player2_fd = set_up_server(2202); // Port for player 2
-    
-    //begin
+
+    // Begin phase
     int width, height;
-    width = height = 20;
     printf("Beginning game...\n");
     begin(player1_fd, 1, &width, &height);
     begin(player2_fd, 2, NULL, NULL);
 
-    //creates board for both players 1 and 2
+    // Create boards for both players
     create_board(&width, &height);
-    
-    char* pieces_info1 = "I 1 1 0 0 1 1 0 2 1 1 0 4 1 1 2 2 1 1 2 0";
-    char* pieces_info2 = "I 1 1 0 0 1 1 0 2 1 1 0 4 1 1 2 2 1 1 2 0";
-    initialize(player1_fd, 1, pieces_info1, &width, &height);
-    initialize(player2_fd, 2, pieces_info2, &width, &height);
 
+    // Initialize phase
+    initialize(player1_fd, 1, NULL, &width, &height);
+    initialize(player2_fd, 2, NULL, &width, &height);
+
+    // Game loop
+    int current_player = 1;
+    bool game_over = false;
+    while (!game_over) {
+        if (current_player == 1) {
+            game_over = shoot(player1_fd, player2_fd, 1, &width, &height);
+            current_player = 2;
+        } else {
+            game_over = shoot(player2_fd, player1_fd, 2, &width, &height);
+            current_player = 1;
+        }
+    }
+
+    // Close sockets
+    close(player1_fd);
+    close(player2_fd);
+
+    printf("Game over!\n");
+    return 0;
 }
 
 //Server Setup --------------------------------------------------------------------------->
@@ -122,8 +140,8 @@ int set_up_server(int PORT){
 void begin(int player_fd, int player, int *width, int *height){
     char buffer[BUFFER_SIZE] = {0};
     int bytes_read = read(player_fd, buffer, BUFFER_SIZE);
+    printf("bytes read: %d\n", bytes_read);
 
-    printf("buffer index 0: %d\n", buffer[0]);
     if(bytes_read <= 0){
         printf("Failed to read from Player %d. Connection closed.\n", player);
         exit(EXIT_FAILURE);
@@ -140,7 +158,7 @@ void begin(int player_fd, int player, int *width, int *height){
     }
     else if(player == 2){
         if(buffer[0] == 'B'){
-            send(player_fd, "B", sizeof("B"), 0);
+            send(player_fd, "A", sizeof("A"), 0);
 
         }
         else{
@@ -741,21 +759,75 @@ bool checkOverlap(int player, int pieces[5][4], int *width, int *height){
 
 //-----------------------------------------------Shoot ships game functions------------------------------------------->
 
-void shoot(int player_fd, int player, int *width, int *height){
+bool shoot(int shooter_fd, int opponent_fd, int player, int *width, int *height){
     char buffer[BUFFER_SIZE] = {0};
-    int bytes_read = read(player_fd, buffer, BUFFER_SIZE);
+    int bytes_read = read(shooter_fd, buffer, BUFFER_SIZE);
 
     if(bytes_read <= 0){
         printf("Failed to read from Player %d. Connection closed.\n", player);
-        send(player_fd, "E 102", sizeof("E 102"), 0);
+        send(shooter_fd, "E 102", sizeof("E 102"), 0);
         exit(EXIT_FAILURE);
     }
 
     if(buffer[0] != 'S'){
-        printf("101: Invalid packet type (Expected Shoot packet)");
-        send(player_fd, "E 101", sizeof("E 101"), 0);
+        printf("102: Invalid packet type (Expected Shoot packet)\n");
+        send(shooter_fd, "E 102", sizeof("E 102"), 0);
         exit(EXIT_FAILURE);
     }
+
+    int row, col;
+    if(sscanf(buffer, "S %d %d", &row, &col) != 2){
+        printf("Invalid Shoot packet format from Player %d.\n", player);
+        send(shooter_fd, "E 202", sizeof("E 202"), 0);
+        exit(EXIT_FAILURE);
+    }
+
+    // Validate coordinates
+    if(row < 0 || row >= *height || col < 0 || col >= *width){
+        printf("cell not in game board %d.\n", player);
+        send(shooter_fd, "E 400", sizeof("E 400"), 0);
+        exit(EXIT_FAILURE);
+    }
+
+    // Determine opponent's board
+    int **opponent_board = (player == 1) ? p2_board : p1_board;
+
+    // Check if the cell was already shot at
+    if(opponent_board[row][col] == -1 || opponent_board[row][col] == -2){
+        printf("cell already guessed %d.\n", player);
+        send(shooter_fd, "E 401", sizeof("E 401"), 0);
+        exit(EXIT_FAILURE);
+    }
+
+    // Check for hit or miss
+    bool game_over = false;
+    if(opponent_board[row][col] == 1){ //hit
+        opponent_board[row][col] = -1; // Mark as hit
+        send(shooter_fd, "H", sizeof("H"), 0);
+
+        //ships sunk? 
+        if(check_ships_sunk(opponent_board, *width, *height)){
+            // Game over
+            send(shooter_fd, "H 1", sizeof("H 1"), 0);
+            send(opponent_fd, "H 0", sizeof("H 0"), 0);
+            game_over = true;
+        }
+    }else{ //miss
+        opponent_board[row][col] = -2; 
+        send(shooter_fd, "M", sizeof("M"), 0);
+    }
+
+    return game_over;
 }
 
-
+// returns true if all ships are sunk
+bool check_ships_sunk(int **board, int width, int height) {
+    for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+            if (board[i][j] == 1) { // a ship aint sunk yet
+                return false; 
+            }
+        }
+    }
+    return true; // All ships are sunk
+}
